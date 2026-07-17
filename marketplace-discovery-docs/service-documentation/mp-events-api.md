@@ -44,10 +44,200 @@ Capture the teams and channels responsible for building, operating, and approvin
 
 ## Architecture and diagrams
 
-[Flow diagram (GitHub)](https://github.com/TCGplayer/mp-events-api/blob/BUY-17432/docs/flowDiagram.md)
+### MP Events API — Flow Diagram
+```mermaid
+flowchart TD
+    subgraph Clients["Browser Clients (CORS-allowlisted origins)"]
+        C1[www.tcgplayer.com]
+        C2[store.tcgplayer.com]
+        C3[cart.tcgplayer.com]
+        C4[Other TCGplayer origins]
+    end
 
-*Architecture diagrams are embedded from Lucidchart — view the [Confluence source page](https://github.com/TCGplayer/mp-events-api/blob/BUY-17432/docs/flowDiagram.md) or the GitHub flow diagram link above for the sequence diagrams.*
+    subgraph API["MP Events API (v1)"]
+        direction TB
+        E1["POST /v1/alias (or /a)\nAssociate identities"]
+        E2["POST /v1/group (or /g)\nAssociate user with group"]
+        E3["POST /v1/identify (or /i)\nIdentify user + traits"]
+        E4["POST /v1/metric (or /m)\nClient-side perf metrics"]
+        E5["POST /v1/page (or /p)\nRecord page view"]
+        E6["POST /v1/track (or /t)\nRecord user action"]
+        HC["GET /lc\nLiveness probe"]
+    end
 
+    subgraph Downstream["Downstream Systems"]
+        KF["Kafka\nTopic: MPEventsApi.Models.SegmentEvent\n(Avro-serialized)"]
+        SR["Confluent Schema Registry\n(ds-schema-registry.tcgplayer.com)"]
+        NR["New Relic\n(APM / Metrics)"]
+    end
+
+    K8S["Kubernetes\n(liveness / readiness probe)"]
+
+    Clients -- "Https Json request" --> E1
+    Clients -- "Https Json request" --> E2
+    Clients -- "Https Json request" --> E3
+    Clients -- "Https Json request" --> E4
+    Clients -- "Https Json request" --> E5
+    Clients -- "Https Json request" --> E6
+
+    E1 -- "Publish SegmentEvent (Avro)" --> KF
+    E2 -- "Publish SegmentEvent (Avro)" --> KF
+    E3 -- "Publish SegmentEvent (Avro)" --> KF
+    E4 -- "Publish SegmentEvent (Avro)" --> KF
+    E5 -- "Publish SegmentEvent (Avro)" --> KF
+    E6 -- "Publish SegmentEvent (Avro)" --> KF
+
+    KF -- "Schema lookup / registration" --> SR
+
+    API -- "Traces & metrics" --> NR
+
+    K8S -- "HTTP GET /lc" --> HC
+```
+
+#### Example Payloads
+
+All endpoints accept any valid JSON object in the request body. The following are representative Segment-format examples.
+
+##### POST /v1/alias — Associate two identities
+
+```json
+{
+  "userId": "user_123",
+  "previousId": "anon_456",
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+##### POST /v1/group — Associate a user with a group
+
+```json
+{
+  "userId": "user_123",
+  "groupId": "store_789",
+  "traits": {
+    "name": "Acme Card Shop",
+    "plan": "pro"
+  },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+##### POST /v1/identify — Identify a user and record traits
+
+```json
+{
+  "userId": "user_123",
+  "anonymousId": "anon_456",
+  "traits": {
+    "email": "user@example.com",
+    "name": "Jane Doe"
+  },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+##### POST /v1/metric — Record a client-side performance metric
+
+```json
+{
+  "type": "metric",
+  "metric": "analytics.js",
+  "value": 1,
+  "tags": {
+    "library": "analytics.js"
+  },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+##### POST /v1/page — Record a page view
+
+```json
+{
+  "userId": "user_123",
+  "name": "Home",
+  "properties": {
+    "url": "https://www.tcgplayer.com",
+    "title": "TCGplayer - Buy, Sell and Collect",
+    "referrer": "https://google.com"
+  },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+##### POST /v1/track — Record a user action
+
+```json
+{
+  "userId": "user_123",
+  "event": "Product Added",
+  "properties": {
+    "productId": "12345",
+    "name": "Black Lotus",
+    "price": 50000.00,
+    "currency": "USD"
+  },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+### MP Events API — Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    actor Browser as Browser Client
+    participant Ingress as Kubernetes Ingress
+
+    box MP Events API
+        participant CORS as CORS Middleware
+        participant Router as MVC Pipeline
+        participant Controller as EventsController
+        participant Publisher as Kafka Publisher
+    end
+
+    box External Dependencies
+        participant SR as Schema Registry
+        participant Kafka as Amazon MSK
+    end
+
+    Browser->>Ingress: HTTPS POST /v1/{event-type}
+    Ingress->>CORS: Forward request
+
+    alt Origin not in CORS allowlist
+        CORS-->>Browser: 403 Forbidden
+    else Origin allowed
+        CORS->>Router: Pass request
+        Router->>Controller: Route to action
+
+        Controller->>Controller: Read and validate request body as JSON
+
+        alt Body is not valid JSON
+            Controller-->>Browser: 200 OK - success false
+        else Body is valid JSON
+            Controller->>Controller: Construct SegmentEvent (Name + Body)
+            Controller->>Publisher: PublishAsync(SegmentEvent)
+
+            Publisher->>SR: Lookup Avro schema
+            SR-->>Publisher: Schema ID
+
+            Publisher->>Kafka: Produce Avro-serialized message
+
+            alt Publish succeeds
+                Kafka-->>Publisher: Ack
+                Publisher-->>Controller: Success
+                Controller-->>Browser: 200 OK - success true
+            else Publish fails (up to 2 retries)
+                Kafka-->>Publisher: Error
+                Publisher-->>Controller: Exception
+                Controller-->>Browser: 200 OK - success false
+            end
+        end
+    end
+
+    Note over Controller, Kafka: New Relic APM traces the full request span
+``` 
 ## How the service works
 
 The mp-events-api takes in event payloads then validates and queues them in kafka for processing.
