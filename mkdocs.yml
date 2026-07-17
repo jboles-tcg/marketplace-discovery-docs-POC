@@ -1,7 +1,29 @@
 site_name: Marketplace Discovery Docs
+theme:
+  locale: en
+  name: material
+  features:
+    - content.code.copy
+    - navigation.tabs
+  palette:
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
         
 docs_dir: marketplace-discovery-docs/
 use_directory_urls: false
+
+markdown_extensions:
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
 
 nav:
   - Home: 
